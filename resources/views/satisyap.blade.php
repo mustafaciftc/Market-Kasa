@@ -13,7 +13,7 @@
             box-sizing: border-box;
         }
         html {
-            font-size: 16px;
+            font-size: 15px;
         }
         body {
             font-family: 'Arial', sans-serif;
@@ -23,10 +23,12 @@
             overflow: hidden;
             padding: 0;
         }
-        .container-fluid {
-            padding: 0;
-            height: calc(100vh - 60px);
-        }
+     .container-fluid {
+    padding: 10px !important;
+}
+		.row {
+    height: 100% !important;
+}
         .header {
             background: linear-gradient(45deg, #007bff, #00c4ff);
             color: white;
@@ -35,11 +37,11 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 10px;
-            border-radius: 5px 5px 0 0;
+			margin-bottom: 0 !important;
+    		border-radius: 0 !important;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-            height: 60px;
         }
+		
         .header h4 {
             margin: 0;
             font-weight: 600;
@@ -56,7 +58,7 @@
         .sidebar {
             background-color: #343a40;
             color: white;
-            padding: 15px;
+            padding: 10px;
             height: 100%;
             border-radius: 5px;
             overflow-y: auto;
@@ -76,11 +78,10 @@
             margin: 5px 0;
         }
         .sidebar .totals h5 {
-            font-size: 1.5rem;
+            font-size: 1rem;
             font-weight: bold;
             color: #ff4444;
             text-align: center;
-            margin: 10px 0;
             padding: 10px;
             background: white;
             border-radius: 10px;
@@ -91,7 +92,7 @@
             margin: 5px 0;
             padding: 10px;
             border-radius: 5px;
-            font-size: 0.9rem;
+            font-size: 0.8rem;
         }
         .sidebar .button-group {
             display: flex;
@@ -112,7 +113,6 @@
         .search-bar {
             display: flex;
             gap: 10px;
-            margin-bottom: 10px;
             flex-wrap: nowrap;
             align-items: center;
         }
@@ -152,7 +152,8 @@
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 5px;
-            margin-top: 10px;
+			position: relative;
+			bottom: 5px;
         }
         .keypad button {
             padding: 10px;
@@ -421,10 +422,10 @@
                 height: auto;
                 overflow-y: auto;
             }
-            .sidebar, .center-area, .category-list {
-                height: auto;
-                max-height: none;
-            }
+      .sidebar, .center-area, .category-list {
+    height: 100% !important;
+    margin-bottom: 0 !important;
+}
             .product-grid {
                 grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
             }

@@ -1193,274 +1193,284 @@ class SaleController extends Controller
 		return view('customer.checkout', compact('cart', 'bankAccounts'));    }
 
   
- public function completeOrder(Request $request)
-    {
-        $startTime = microtime(true);
-        Log::info('Starting completeOrder', [
-            'user_id' => auth()->id(),
-            'request' => $request->all(),
-        ]);
-
-        try {
-            // Validate request data
-            $validated = $request->validate([
-                'payment_method' => 'required|in:bank_transfer,cash_on_delivery,credit,credit_card',
-                'phone' => 'required|string|regex:/^[0-9]{10,15}$/',
-                'shipping_address' => 'required|string|max:500',
-                'bank_receipt' => 'nullable|string|max:255|required_if:payment_method,bank_transfer',
-            ]);
-
-            // Retrieve cart from session
-            $cart = $request->session()->get('customer_cart', [
-                'items' => [],
-                'sub_total' => 0,
-                'discount_total' => 0,
-                'total' => 0,
-            ]);
-
-            // Check if cart is empty
-            if (empty($cart['items'])) {
-                Log::warning('Cart is empty', [
-                    'user_id' => auth()->id(),
-                    'duration' => microtime(true) - $startTime,
-                ]);
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Sepetiniz boş',
-                    'redirect_url' => route('customer.failure.generic')
-                ], 400);
-            }
-
-            // Find or create customer
-            $customer = Customer::where('email', auth()->user()->email)->first();
-            if (!$customer) {
-                $customer = Customer::create([
-                    'name' => auth()->user()->name,
-                    'email' => auth()->user()->email,
-                    'phone' => $validated['phone'],
-                ]);
-                Log::info('New customer created', ['customer_id' => $customer->id]);
-            } elseif ($validated['phone'] && $customer->phone !== $validated['phone']) {
-                $customer->phone = $validated['phone'];
-                $customer->save();
-                Log::info('Customer phone updated', ['customer_id' => $customer->id]);
-            }
-
-            // Ensure surname is available for Iyzico (fallback to default if not present)
-            $surname = auth()->user()->surname ?? 'Unknown';
-            if (empty($surname) || $surname === 'Unknown') {
-                Log::warning('Surname not found, using default', ['user_id' => auth()->id()]);
-            }
-
-            DB::beginTransaction();
-
-            // Create sale record
-            $sale = Sale::create([
-                'user_id' => auth()->id(),
-                'basket' => json_encode($cart['items']),
-                'customer_id' => $customer->id,
-                'sub_total' => $cart['sub_total'],
-                'discount_total' => $cart['discount_total'] ?? 0,
-                'total_price' => $cart['total'],
-                'pay_type' => $this->getPaymentType($validated['payment_method']),
-                'created_at' => now(),
-                'updated_at' => now(),
-            ]);
-
-            // Handle credit card payment via Iyzico
-            if ($validated['payment_method'] === 'credit_card') {
-                $userData = [
-                    'id' => $customer->id,
-                    'name' => $customer->name,
-                    'email' => $customer->email,
-                    'phone' => $validated['phone'],
-                    'surname' => $surname, // Use derived or default surname
-                ];
-
-                $iyzicoCart = [
-                    'items' => array_map(function ($item) {
-                        $product = Product::find($item['product_id']);
-                        return [
-                            'product_id' => $item['product_id'],
-                            'name' => $item['name'],
-                            'category' => $product ? $product->category->name ?? 'Genel' : 'Genel',
-                            'price' => $item['price'],
-                            'quantity' => $item['quantity'],
-                        ];
-                    }, $cart['items']),
-                    'sub_total' => $cart['sub_total'],
-                    'discount_total' => $cart['discount_total'],
-                    'total' => $cart['total'],
-                ];
-
-                Log::info('Attempting to initialize Iyzico checkout form', [
-                    'sale_id' => $sale->id,
-                    'user_id' => auth()->id(),
-                    'total_price' => $cart['total'],
-                ]);
-
-                $iyzicoResult = $this->initializeIyzicoCheckoutForm($sale, $iyzicoCart, $userData, $validated['shipping_address']);
-
-                if (!$iyzicoResult['success']) {
-                    Log::error('Iyzico checkout form initialization failed', [
-                        'sale_id' => $sale->id,
-                        'error' => $iyzicoResult['message'] ?? 'Unknown error',
-                        'iyzico_result' => $iyzicoResult,
-                        'duration' => microtime(true) - $startTime,
-                    ]);
-                    throw new \Exception($iyzicoResult['message'] ?? 'Iyzico ödeme formu oluşturulamadı.');
-                }
-
-                PaymentDetail::create([
-                    'sale_id' => $sale->id,
-                    'payment_method' => 'credit_card',
-                    'amount' => $cart['total'],
-                    'details' => json_encode([
-                        'method' => 'credit_card',
-                        'status' => 'pending',
-                        'iyzico_token' => $iyzicoResult['token'],
-                    ]),
-                ]);
-
-                session()->put('iyzico_order', [
-                    'order_id' => $sale->id,
-                    'token' => $iyzicoResult['token'],
-                    'user_id' => auth()->id(),
-                    'session_id' => session()->getId(),
-                ]);
-
-                session()->put('user_auth_backup', [
-                    'user_id' => auth()->id(),
-                    'order_id' => $sale->id,
-                    'created_at' => now(),
-                ]);
-
-                session()->save();
-
-                Log::info('Iyzico checkout form initialized successfully', [
-                    'sale_id' => $sale->id,
-                    'user_id' => auth()->id(),
-                    'total_price' => $cart['total'],
-                    'iyzico_token' => $iyzicoResult['token'],
-                    'duration' => microtime(true) - $startTime,
-                ]);
-
-                DB::commit();
-
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Ödeme formu oluşturuldu.',
-                    'iyzico_form' => $iyzicoResult['html_content'],
-                    'redirect_url' => null
-                ], 200);
-            }
-
-            // Handle bank transfer
-            if ($validated['payment_method'] === 'bank_transfer') {
-                PaymentDetail::create([
-                    'sale_id' => $sale->id,
-                    'payment_method' => 'bank_transfer',
-                    'amount' => $cart['total'],
-                    'details' => json_encode([
-                        'method' => 'bank_transfer',
-                        'status' => 'pending',
-                        'bank_receipt' => $validated['bank_receipt'],
-                    ]),
-                ]);
-
-                $request->session()->forget('customer_cart');
-                DB::commit();
-
-                Log::info('Bank transfer order completed', [
-                    'sale_id' => $sale->id,
-                    'user_id' => auth()->id(),
-                    'total_price' => $cart['total'],
-                    'duration' => microtime(true) - $startTime,
-                ]);
-
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Siparişiniz banka havalesi ile alınmıştır. Onay için dekontunuzu kontrol edeceğiz.',
-                    'redirect_url' => route('customer.success', ['sale_id' => $sale->id])
-                ], 200);
-            }
-
-            // Handle cash on delivery
-            if ($validated['payment_method'] === 'cash_on_delivery') {
-                PaymentDetail::create([
-                    'sale_id' => $sale->id,
-                    'payment_method' => 'cash_on_delivery',
-                    'amount' => $cart['total'],
-                    'details' => json_encode([
-                        'method' => 'cash_on_delivery',
-                        'status' => 'pending',
-                    ]),
-                ]);
-
-                $request->session()->forget('customer_cart');
-                DB::commit();
-
-                Log::info('Cash on delivery order completed', [
-                    'sale_id' => $sale->id,
-                    'user_id' => auth()->id(),
-                    'total_price' => $cart['total'],
-                    'duration' => microtime(true) - $startTime,
-                ]);
-
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Kapıda ödeme siparişiniz alınmıştır.',
-                    'redirect_url' => route('customer.success', ['sale_id' => $sale->id])
-                ], 200);
-            }
-
-            // Handle credit payment
-            if ($validated['payment_method'] === 'credit') {
-                PaymentDetail::create([
-                    'sale_id' => $sale->id,
-                    'payment_method' => 'credit',
-                    'amount' => $cart['total'],
-                    'details' => json_encode([
-                        'method' => 'credit',
-                        'status' => 'pending',
-                    ]),
-                ]);
-
-                $request->session()->forget('customer_cart');
-                DB::commit();
-
-                Log::info('Credit order completed', [
-                    'sale_id' => $sale->id,
-                    'user_id' => auth()->id(),
-                    'total_price' => $cart['total'],
-                    'duration' => microtime(true) - $startTime,
-                ]);
-
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Veresiye ile ödeme siparişiniz alınmıştır.',
-                    'redirect_url' => route('customer.success', ['sale_id' => $sale->id])
-                ], 200);
-            }
-
-            throw new \Exception('Geçersiz ödeme yöntemi.');
-        } catch (\Exception $e) {
-            DB::rollBack();
-            Log::error('Order completion error: ' . $e->getMessage(), [
+        public function completeOrder(Request $request)
+        {
+            $startTime = microtime(true);
+            Log::info('Starting completeOrder', [
                 'user_id' => auth()->id(),
                 'request' => $request->all(),
-                'trace' => $e->getTraceAsString(),
-                'duration' => microtime(true) - $startTime,
             ]);
-            $saleId = isset($sale) ? $sale->id : null;
-            return response()->json([
-                'success' => false,
-                'message' => 'İşlem sırasında bir hata oluştu: ' . $e->getMessage(),
-                'redirect_url' => $saleId ? route('customer.failure', ['sale_id' => $saleId]) : route('customer.failure.generic')
-            ], 500);
+        
+            try {
+                $validated = $request->validate([
+                    'payment_method' => 'required|in:bank_transfer,cash_on_delivery,credit,credit_card',
+                    'phone' => 'nullable|string|regex:/^[0-9]{10,15}$/', // Telefon opsiyonel
+                    'shipping_address' => 'required|string|max:500',
+                    'bank_receipt' => 'nullable|string|max:255|required_if:payment_method,bank_transfer',
+                ]);
+        
+                $cart = $request->session()->get('customer_cart', [
+                    'items' => [],
+                    'sub_total' => 0,
+                    'discount_total' => 0,
+                    'total' => 0,
+                ]);
+        
+                if (empty($cart['items'])) {
+                    Log::warning('Cart is empty', [
+                        'user_id' => auth()->id(),
+                        'duration' => microtime(true) - $startTime,
+                    ]);
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Sepetiniz boş',
+                        'redirect_url' => route('customer.failure.generic')
+                    ], 400);
+                }
+        
+                $customer = Customer::where('email', auth()->user()->email)->first();
+                if (!$customer) {
+                    $customer = Customer::create([
+                        'name' => auth()->user()->name,
+                        'email' => auth()->user()->email,
+                        'phone' => !empty($validated['phone']) ? $validated['phone'] : null, // Boş string kontrolü
+                    ]);
+                    Log::info('New customer created', [
+                        'customer_id' => $customer->id,
+                        'phone_provided' => !empty($validated['phone'])
+                    ]);
+                } elseif (isset($validated['phone']) && !empty($validated['phone']) && $customer->phone !== $validated['phone']) {
+                    // Sadece telefon girilmişse ve mevcut telefondan farklıysa güncelle
+                    $customer->phone = $validated['phone'];
+                    $customer->save();
+                    Log::info('Customer phone updated', [
+                        'customer_id' => $customer->id,
+                        'new_phone' => $validated['phone']
+                    ]);
+                } elseif (isset($validated['phone']) && empty($validated['phone'])) {
+                    // Telefon alanı boş gönderildiyse null yap
+                    $customer->phone = null;
+                    $customer->save();
+                    Log::info('Customer phone cleared', ['customer_id' => $customer->id]);
+                }
+        
+                $surname = auth()->user()->surname ?? 'Unknown';
+                if (empty($surname) || $surname === 'Unknown') {
+                    Log::warning('Surname not found, using default', ['user_id' => auth()->id()]);
+                }
+        
+                DB::beginTransaction();
+        
+                $sale = Sale::create([
+                    'user_id' => auth()->id(),
+                    'basket' => json_encode($cart['items']),
+                    'customer_id' => $customer->id,
+                    'sub_total' => $cart['sub_total'],
+                    'discount_total' => $cart['discount_total'] ?? 0,
+                    'total_price' => $cart['total'],
+                    'pay_type' => $this->getPaymentType($validated['payment_method']),
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+        
+                if ($validated['payment_method'] === 'credit_card') {
+                    $userData = [
+                        'id' => $customer->id,
+                        'name' => $customer->name,
+                        'email' => $customer->email,
+                        'phone' => !empty($validated['phone']) ? $validated['phone'] : ($customer->phone ?? '0000000000'), // Fallback telefon
+                        'surname' => $surname, 
+                    ];
+        
+                    $iyzicoCart = [
+                        'items' => array_map(function ($item) {
+                            $product = Product::find($item['product_id']);
+                            return [
+                                'product_id' => $item['product_id'],
+                                'name' => $item['name'],
+                                'category' => $product ? $product->category->name ?? 'Genel' : 'Genel',
+                                'price' => $item['price'],
+                                'quantity' => $item['quantity'],
+                            ];
+                        }, $cart['items']),
+                        'sub_total' => $cart['sub_total'],
+                        'discount_total' => $cart['discount_total'],
+                        'total' => $cart['total'],
+                    ];
+        
+                    Log::info('Attempting to initialize Iyzico checkout form', [
+                        'sale_id' => $sale->id,
+                        'user_id' => auth()->id(),
+                        'total_price' => $cart['total'],
+                        'phone_provided' => !empty($validated['phone']),
+                    ]);
+        
+                    $iyzicoResult = $this->initializeIyzicoCheckoutForm($sale, $iyzicoCart, $userData, $validated['shipping_address']);
+        
+                    if (!$iyzicoResult['success']) {
+                        Log::error('Iyzico checkout form initialization failed', [
+                            'sale_id' => $sale->id,
+                            'error' => $iyzicoResult['message'] ?? 'Unknown error',
+                            'iyzico_result' => $iyzicoResult,
+                            'duration' => microtime(true) - $startTime,
+                        ]);
+                        throw new \Exception($iyzicoResult['message'] ?? 'Iyzico ödeme formu oluşturulamadı.');
+                    }
+        
+                    PaymentDetail::create([
+                        'sale_id' => $sale->id,
+                        'payment_method' => 'credit_card',
+                        'amount' => $cart['total'],
+                        'details' => json_encode([
+                            'method' => 'credit_card',
+                            'status' => 'pending',
+                            'iyzico_token' => $iyzicoResult['token'],
+                            'phone_provided' => !empty($validated['phone']),
+                        ]),
+                    ]);
+        
+                    session()->put('iyzico_order', [
+                        'order_id' => $sale->id,
+                        'token' => $iyzicoResult['token'],
+                        'user_id' => auth()->id(),
+                        'session_id' => session()->getId(),
+                    ]);
+        
+                    session()->put('user_auth_backup', [
+                        'user_id' => auth()->id(),
+                        'order_id' => $sale->id,
+                        'created_at' => now(),
+                    ]);
+        
+                    session()->save();
+        
+                    Log::info('Iyzico checkout form initialized successfully', [
+                        'sale_id' => $sale->id,
+                        'user_id' => auth()->id(),
+                        'total_price' => $cart['total'],
+                        'iyzico_token' => $iyzicoResult['token'],
+                        'phone_provided' => !empty($validated['phone']),
+                        'duration' => microtime(true) - $startTime,
+                    ]);
+        
+                    DB::commit();
+        
+                    return response()->json([
+                        'success' => true,
+                        'message' => 'Ödeme formu oluşturuldu.',
+                        'iyzico_form' => $iyzicoResult['html_content'],
+                        'redirect_url' => null
+                    ], 200);
+                }
+        
+                if ($validated['payment_method'] === 'bank_transfer') {
+                    PaymentDetail::create([
+                        'sale_id' => $sale->id,
+                        'payment_method' => 'bank_transfer',
+                        'amount' => $cart['total'],
+                        'details' => json_encode([
+                            'method' => 'bank_transfer',
+                            'status' => 'pending',
+                            'bank_receipt' => $validated['bank_receipt'],
+                            'phone_provided' => !empty($validated['phone']),
+                        ]),
+                    ]);
+        
+                    $request->session()->forget('customer_cart');
+                    DB::commit();
+        
+                    Log::info('Bank transfer order completed', [
+                        'sale_id' => $sale->id,
+                        'user_id' => auth()->id(),
+                        'total_price' => $cart['total'],
+                        'phone_provided' => !empty($validated['phone']),
+                        'duration' => microtime(true) - $startTime,
+                    ]);
+        
+                    return response()->json([
+                        'success' => true,
+                        'message' => 'Siparişiniz banka havalesi ile alınmıştır. Onay için dekontunuzu kontrol edeceğiz.',
+                        'redirect_url' => route('customer.success', ['sale_id' => $sale->id])
+                    ], 200);
+                }
+        
+                if ($validated['payment_method'] === 'cash_on_delivery') {
+                    PaymentDetail::create([
+                        'sale_id' => $sale->id,
+                        'payment_method' => 'cash_on_delivery',
+                        'amount' => $cart['total'],
+                        'details' => json_encode([
+                            'method' => 'cash_on_delivery',
+                            'status' => 'pending',
+                            'phone_provided' => !empty($validated['phone']),
+                        ]),
+                    ]);
+        
+                    $request->session()->forget('customer_cart');
+                    DB::commit();
+        
+                    Log::info('Cash on delivery order completed', [
+                        'sale_id' => $sale->id,
+                        'user_id' => auth()->id(),
+                        'total_price' => $cart['total'],
+                        'phone_provided' => !empty($validated['phone']),
+                        'duration' => microtime(true) - $startTime,
+                    ]);
+        
+                    return response()->json([
+                        'success' => true,
+                        'message' => 'Kapıda ödeme siparişiniz alınmıştır.',
+                        'redirect_url' => route('customer.success', ['sale_id' => $sale->id])
+                    ], 200);
+                }
+        
+                if ($validated['payment_method'] === 'credit') {
+                    PaymentDetail::create([
+                        'sale_id' => $sale->id,
+                        'payment_method' => 'credit',
+                        'amount' => $cart['total'],
+                        'details' => json_encode([
+                            'method' => 'credit',
+                            'status' => 'pending',
+                            'phone_provided' => !empty($validated['phone']),
+                        ]),
+                    ]);
+        
+                    $request->session()->forget('customer_cart');
+                    DB::commit();
+        
+                    Log::info('Credit order completed', [
+                        'sale_id' => $sale->id,
+                        'user_id' => auth()->id(),
+                        'total_price' => $cart['total'],
+                        'phone_provided' => !empty($validated['phone']),
+                        'duration' => microtime(true) - $startTime,
+                    ]);
+        
+                    return response()->json([
+                        'success' => true,
+                        'message' => 'Veresiye ile ödeme siparişiniz alınmıştır.',
+                        'redirect_url' => route('customer.success', ['sale_id' => $sale->id])
+                    ], 200);
+                }
+        
+                throw new \Exception('Geçersiz ödeme yöntemi.');
+            } catch (\Exception $e) {
+                DB::rollBack();
+                Log::error('Order completion error: ' . $e->getMessage(), [
+                    'user_id' => auth()->id(),
+                    'request' => $request->all(),
+                    'trace' => $e->getTraceAsString(),
+                    'duration' => microtime(true) - $startTime,
+                ]);
+                $saleId = isset($sale) ? $sale->id : null;
+                return response()->json([
+                    'success' => false,
+                    'message' => 'İşlem sırasında bir hata oluştu: ' . $e->getMessage(),
+                    'redirect_url' => $saleId ? route('customer.failure', ['sale_id' => $saleId]) : route('customer.failure.generic')
+                ], 500);
+            }
         }
-    }
-	
 private function initializeIyzicoCheckoutForm($sale, $cart, $userData, $shippingAddress)
     {
         try {
@@ -1470,7 +1480,7 @@ private function initializeIyzicoCheckoutForm($sale, $cart, $userData, $shipping
     Log::error('Iyzico checkout form initialization failed', [
         'sale_id' => $sale->id,
         'error' => $errorMessage,
-        'iyzico_response' => $result, // Iyzico'nun tam yanıtını logla
+        'iyzico_response' => $result,
     ]);
     throw new \Exception('Iyzico ödeme formu oluşturulamadı: ' . $errorMessage);
 }

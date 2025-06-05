@@ -66,7 +66,9 @@ class IyzicoService
             $buyer->setId($userData['id']);
             $buyer->setName($userData['name']);
             $buyer->setSurname($userData['surname'] ?? '');
-            $buyer->setGsmNumber($userData['phone']);
+			if (isset($userData['phone']) && !empty(trim($userData['phone']))) {
+                $buyer->setGsmNumber($userData['phone']);
+            }
             $buyer->setEmail($userData['email']);
             $buyer->setIdentityNumber('11111111111'); 
             $buyer->setRegistrationAddress($shippingAddress);
@@ -150,7 +152,6 @@ class IyzicoService
             throw new \Exception($result->getErrorMessage() ?? 'Ödeme doğrulanamadı.');
         }
 
-        // Correct way to get payment items
         $paymentItems = $result->getPaymentItems() ?: [];
 
         Log::info('Iyzico payment verification successful', [
